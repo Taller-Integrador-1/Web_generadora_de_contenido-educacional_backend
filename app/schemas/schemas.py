@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 class ChatRequest(BaseModel):
     usuario_id: str
@@ -18,7 +18,7 @@ class PistonFile(BaseModel):
 class ExecuteRequest(BaseModel):
     language: str
     version: str
-    files: list[PistonFile]
+    files: List[PistonFile]
 
 class LoginRequest(BaseModel):
     usuario_id: str

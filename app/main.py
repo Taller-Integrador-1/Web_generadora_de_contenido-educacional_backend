@@ -4,7 +4,7 @@ from sqlalchemy import text
 from app.config.database import engine, get_db
 from app.models import models
 from app.schemas.schemas import (
-    ChatRequest, ChatResponse, CompileRequest, ExecuteRequest,
+    ChatRequest, ChatResponse, ExecuteRequest,
     LoginRequest, RegisterRequest, LoginResponse, UserUpdate
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -159,25 +159,71 @@ async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/execute")
 def proxy_execute_code(request: ExecuteRequest):
+    import subprocess
+    import tempfile
+    import os
+
     try:
-        piston_url = "http://localhost:2000/api/v2/execute"
-        
-        payload = {
-            "language": request.language,
-            "version": request.version,
-            "files": [{"name": f.name, "content": f.content} for f in request.files]
-        }
-        
-        response = requests.post(piston_url, json=payload)
-        
-        if response.status_code == 401:
-            raise HTTPException(status_code=401, detail="Piston API requiere autorización.")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            main_file = None
             
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Error conectando con el motor Piston: {str(e)}")
+            for f in request.files:
+                file_path = os.path.join(temp_dir, f.name)
+                with open(file_path, "w", encoding="utf-8") as out:
+                    out.write(f.content)
+                if f.name.endswith(".py") or f.name == "Main.java":
+                    main_file = f.name
+            
+            if not main_file:
+                return {"compile": {"stderr": "No se encontró el archivo principal (.py o Main.java)"}, "run": {"code": 1}}
+
+            if request.language == "python":
+                try:
+                    result = subprocess.run(
+                        ["python3", main_file], 
+                        cwd=temp_dir, capture_output=True, text=True, timeout=5
+                    )
+                    return {
+                        "run": {
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "code": result.returncode,
+                            "signal": None
+                        }
+                    }
+                except subprocess.TimeoutExpired:
+                    return {"run": {"stdout": "", "stderr": "Error: Tiempo límite de ejecución excedido (5s).", "code": 1}}
+            
+            elif request.language == "java":
+                try:
+                    compile_result = subprocess.run(
+                        ["javac", main_file], 
+                        cwd=temp_dir, capture_output=True, text=True, timeout=5
+                    )
+                    if compile_result.returncode != 0:
+                        return {"compile": {"stderr": compile_result.stderr}, "run": {"code": 1}}
+                    
+                    class_name = main_file.replace(".java", "")
+                    result = subprocess.run(
+                        ["java", class_name], 
+                        cwd=temp_dir, capture_output=True, text=True, timeout=5
+                    )
+                    return {
+                        "run": {
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "code": result.returncode,
+                            "signal": None
+                        }
+                    }
+                except subprocess.TimeoutExpired:
+                    return {"run": {"stdout": "", "stderr": "Error: Tiempo límite de ejecución excedido (5s).", "code": 1}}
+            
+            else:
+                return {"compile": {"stderr": f"Lenguaje no soportado: {request.language}"}, "run": {"code": 1}}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"compile": {"stderr": f"Error interno del servidor: {str(e)}"}, "run": {"code": 1}}
 
 
 @app.post("/api/register", response_model=LoginResponse)
