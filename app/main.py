@@ -283,11 +283,11 @@ async def login_usuario(request: LoginRequest, db: Session = Depends(get_db)):
         usuario_id=usuario.id,
         nombre=usuario.nombre,
         correo=usuario.correo,
-        rol=usuario.rol,
-        xp=usuario.xp,
-        nivel=usuario.nivel,
-        tema_actual=usuario.tema_actual,
-        porcentaje=usuario.porcentaje,
+        rol=usuario.rol or "student",
+        xp=usuario.xp or 0,
+        nivel=usuario.nivel or 1,
+        tema_actual=usuario.tema_actual or "Variables",
+        porcentaje=usuario.porcentaje or 0,
         status="success"
     )
 
