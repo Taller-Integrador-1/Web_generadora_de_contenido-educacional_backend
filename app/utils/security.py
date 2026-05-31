@@ -6,9 +6,7 @@ def hash_password(password: str) -> str:
     Genera un hash seguro para la contraseña provista usando PBKDF2-SHA256 y sal (salt).
     Retorna el string con el formato 'sal:hash_hex'.
     """
-    # Generar una sal aleatoria de 16 bytes
     salt = os.urandom(16).hex()
-    # Calcular el hash seguro usando PBKDF2 con 100,000 iteraciones
     pwd_hash = hashlib.pbkdf2_hmac(
         'sha256', 
         password.encode('utf-8'), 

@@ -47,3 +47,31 @@ class UserUpdate(BaseModel):
     nivel: Optional[int] = None
     tema_actual: Optional[str] = None
     porcentaje: Optional[int] = None
+
+class EjercicioResponse(BaseModel):
+    id: int
+    titulo: str
+    descripcion: str
+    tema: str
+    dificultad: str
+    codigo_inicial_python: Optional[str] = None
+    codigo_inicial_java: Optional[str] = None
+    casos_prueba: Optional[str] = None
+    aprobado: bool
+    resuelto: bool = False
+
+    class Config:
+        from_attributes = True
+        orm_mode = True
+
+class ValidateRequest(BaseModel):
+    usuario_id: str
+    ejercicio_id: int
+    resolucion_codigo: str
+    resultado_consola: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    nombre: str
+    correo: str
+    contrasena: Optional[str] = None

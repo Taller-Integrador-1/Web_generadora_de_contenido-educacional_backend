@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
 
@@ -41,3 +41,18 @@ class MensajeLog(Base):
     fecha = Column(DateTime, default=datetime.utcnow)
     
     sesion = relationship("SesionChat", back_populates="mensajes")
+
+class Ejercicio(Base):
+    __tablename__ = "ejercicios"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    titulo = Column(String(150), nullable=False)
+    descripcion = Column(Text, nullable=False)
+    tema = Column(String(100), nullable=False)
+    dificultad = Column(String(50), nullable=False, default="Media")
+    codigo_inicial_python = Column(Text, nullable=True)
+    codigo_inicial_java = Column(Text, nullable=True)
+    casos_prueba = Column(Text, nullable=True)
+    aprobado = Column(Boolean, default=False)
+    resuelto = Column(Boolean, default=False)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
