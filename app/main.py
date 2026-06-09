@@ -95,7 +95,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def read_root():
+    return {
+        "status": "healthy",
+        "service": "API Tutor Socrático Algoritmia",
+        "message": "Servidor activo. Accede a /docs para ver la documentación de la API."
+    }
+
 dify_service = DifyService()
+
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
@@ -944,7 +953,18 @@ async def validate_exercise(request: ValidateRequest, db: Session = Depends(get_
         if is_correct and usuario:
             check_and_advance_empty_topics(usuario, db)
             
-            usuario.xp += 100
+            # Calcular XP según la dificultad del ejercicio
+            xp_ganado = 100
+            if ejercicio.dificultad:
+                diff_lower = ejercicio.dificultad.lower()
+                if "fácil" in diff_lower or "facil" in diff_lower:
+                    xp_ganado = 100
+                elif "media" in diff_lower or "medio" in diff_lower:
+                    xp_ganado = 300
+                elif "difícil" in diff_lower or "dificil" in diff_lower:
+                    xp_ganado = 500
+            
+            usuario.xp += xp_ganado
             nuevo_nivel = (usuario.xp // 1000) + 1
             if nuevo_nivel != usuario.nivel:
                 usuario.nivel = nuevo_nivel
