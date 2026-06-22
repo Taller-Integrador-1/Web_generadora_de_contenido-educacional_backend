@@ -5,6 +5,10 @@ class ChatRequest(BaseModel):
     usuario_id: str
     mensaje: str
     dify_conversation_id: Optional[str] = None
+    ejercicio_titulo: Optional[str] = None
+    ejercicio_descripcion: Optional[str] = None
+    codigo_alumno: Optional[str] = None
+    tutor_level: Optional[str] = None
 
 class ChatResponse(BaseModel):
     respuesta: str
@@ -75,3 +79,14 @@ class ProfileUpdateRequest(BaseModel):
     nombre: str
     correo: str
     contrasena: Optional[str] = None
+
+
+class AnswerItem(BaseModel):
+    pregunta_id: int
+    respuesta: str
+
+
+class ExamSubmitRequest(BaseModel):
+    usuario_id: str
+    respuestas: List[AnswerItem]
+

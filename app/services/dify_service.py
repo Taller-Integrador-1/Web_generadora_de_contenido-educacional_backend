@@ -13,9 +13,9 @@ class DifyService:
         }
         self.url = f"{base_url}/chat-messages"
 
-    def enviar_mensaje(self, query: str, user_id: str, conversation_id: str = None) -> dict:
+    def enviar_mensaje(self, query: str, user_id: str, conversation_id: str = None, inputs: dict = None) -> dict:
         payload = {
-            "inputs": {},
+            "inputs": inputs or {},
             "query": query,
             "response_mode": "blocking",
             "user": user_id,

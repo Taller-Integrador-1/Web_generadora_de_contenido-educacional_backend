@@ -56,3 +56,33 @@ class Ejercicio(Base):
     aprobado = Column(Boolean, default=False)
     resuelto = Column(Boolean, default=False)
     fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+class ResolucionEjercicio(Base):
+    __tablename__ = "resoluciones_ejercicios"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    usuario_id = Column(String(50), ForeignKey("usuarios.id"), nullable=False)
+    ejercicio_id = Column(Integer, ForeignKey("ejercicios.id"), nullable=False)
+    fecha_resolucion = Column(DateTime, default=datetime.utcnow)
+
+
+class Silabo(Base):
+    __tablename__ = "silabos"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    filename = Column(String(255), nullable=False)
+    contenido = Column(Text, nullable=False)
+    fecha_subida = Column(DateTime, default=datetime.utcnow)
+
+
+class PreguntaExamen(Base):
+    __tablename__ = "preguntas_examen"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tema = Column(String(100), nullable=False)
+    pregunta = Column(Text, nullable=False)
+    opcion_a = Column(String(255), nullable=False)
+    opcion_b = Column(String(255), nullable=False)
+    opcion_c = Column(String(255), nullable=False)
+    opcion_d = Column(String(255), nullable=False)
+    respuesta_correcta = Column(String(1), nullable=False)

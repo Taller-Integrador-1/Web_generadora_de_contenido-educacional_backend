@@ -6,7 +6,8 @@ from app.models import models
 from app.schemas.schemas import (
     ChatRequest, ChatResponse, ExecuteRequest,
     LoginRequest, RegisterRequest, LoginResponse, UserUpdate,
-    EjercicioResponse, ValidateRequest, ProfileUpdateRequest
+    EjercicioResponse, ValidateRequest, ProfileUpdateRequest,
+    ExamSubmitRequest
 )
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.dify_service import DifyService
@@ -109,10 +110,18 @@ dify_service = DifyService()
 @app.post("/api/chat", response_model=ChatResponse)
 async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
     try:
+        inputs_dify = {
+            "ejercicio_titulo": request.ejercicio_titulo or "",
+            "ejercicio_descripcion": request.ejercicio_descripcion or ""
+        }
+
+        query_completa = request.mensaje
+
         resultado_dify = dify_service.enviar_mensaje(
-            query=request.mensaje,
+            query=query_completa,
             user_id=request.usuario_id,
-            conversation_id=request.dify_conversation_id
+            conversation_id=request.dify_conversation_id,
+            inputs=inputs_dify
         )
         
         respuesta_juez = resultado_dify.get("answer")
@@ -242,8 +251,28 @@ def proxy_execute_code(request: ExecuteRequest):
         return {"compile": {"stderr": f"Error interno del servidor: {str(e)}"}, "run": {"code": 1}}
 
 
+def get_all_topics_from_db(db: Session, only_approved: bool = False) -> list:
+    query = db.query(models.Ejercicio.tema)
+    if only_approved:
+        query = query.filter(models.Ejercicio.aprobado == True)
+    db_topics = query.distinct().all()
+    all_topics = [t[0] for t in db_topics if t[0]]
+    
+    canonical_order = ["Variables", "Tipos de Datos", "Operadores", "Condicionales", "Bucles For", "Bucles While", "Funciones", "Arrays", "Objetos"]
+    def get_sort_key(topic):
+        try:
+            return (0, canonical_order.index(topic))
+        except ValueError:
+            return (1, topic)
+    all_topics.sort(key=get_sort_key)
+    
+    if not all_topics:
+        all_topics = canonical_order
+    return all_topics
+
+
 def check_and_advance_empty_topics(usuario: models.Usuario, db: Session):
-    all_topics = ["Variables", "Tipos de Datos", "Operadores", "Condicionales", "Bucles For", "Bucles While", "Funciones", "Arrays", "Objetos"]
+    all_topics = get_all_topics_from_db(db, only_approved=True)
     
     if not usuario.tema_actual or usuario.tema_actual not in all_topics:
         usuario.tema_actual = "Variables"
@@ -278,10 +307,13 @@ def check_and_advance_empty_topics(usuario: models.Usuario, db: Session):
             else:
                 break
         else:
-            num_resueltos = db.query(models.Ejercicio).filter(
+            num_resueltos = db.query(models.Ejercicio).join(
+                models.ResolucionEjercicio,
+                models.ResolucionEjercicio.ejercicio_id == models.Ejercicio.id
+            ).filter(
                 models.Ejercicio.aprobado == True,
                 models.Ejercicio.tema.ilike(all_topics[idx]),
-                models.Ejercicio.resuelto == True
+                models.ResolucionEjercicio.usuario_id == usuario.id
             ).count()
             
             if num_resueltos >= num_ejercicios:
@@ -404,6 +436,45 @@ async def obtener_historial_chat(usuario_id: str, db: Session = Depends(get_db))
     }
 
 
+@app.get("/api/topics")
+def get_topics(db: Session = Depends(get_db)):
+    return get_all_topics_from_db(db, only_approved=False)
+
+
+@app.get("/api/admin/dify-documents")
+async def get_dify_documents():
+    DIFY_API_KEY_DATASET = os.getenv("DIFY_API_KEY_DATASET")
+    DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID")
+    
+    if not DIFY_API_KEY_DATASET or not DIFY_DATASET_ID or "placeholder" in DIFY_API_KEY_DATASET:
+        return {"documents": []}
+        
+    try:
+        url = f"https://api.dify.ai/v1/datasets/{DIFY_DATASET_ID}/documents"
+        headers = {
+            "Authorization": f"Bearer {DIFY_API_KEY_DATASET}"
+        }
+        r = requests.get(url, headers=headers, params={"limit": 100}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return {"documents": data.get("data", [])}
+    except Exception as e:
+        print(f"[Dify Documents API Error] {e}")
+        return {"documents": [], "error": str(e)}
+
+
+@app.get("/api/admin/syllabus")
+async def get_active_syllabus(db: Session = Depends(get_db)):
+    silabo = db.query(models.Silabo).order_by(models.Silabo.fecha_subida.desc()).first()
+    if not silabo:
+        return {"filename": None, "contenido": "", "fecha_subida": None}
+    return {
+        "filename": silabo.filename,
+        "contenido": silabo.contenido,
+        "fecha_subida": silabo.fecha_subida.isoformat() if silabo.fecha_subida else None
+    }
+
+
 @app.get("/api/admin/users")
 async def get_all_students(db: Session = Depends(get_db)):
     usuarios = db.query(models.Usuario).filter(models.Usuario.rol == "student").all()
@@ -417,6 +488,202 @@ async def get_all_students(db: Session = Depends(get_db)):
         "tema_actual": u.tema_actual,
         "porcentaje": u.porcentaje
     } for u in usuarios]
+
+
+DEFAULT_EXAM_QUESTIONS = [
+    {
+        "tema": "Variables",
+        "pregunta": "¿Cuál de las siguientes declaraciones de variables en Python es válida?",
+        "opcion_a": "1_variable = 5",
+        "opcion_b": "variable-uno = 5",
+        "opcion_c": "variable_uno = 5",
+        "opcion_d": "class = 5",
+        "respuesta_correcta": "C"
+    },
+    {
+        "tema": "Tipos de Datos",
+        "pregunta": "¿Cuál es el tipo de datos del valor 3.1416?",
+        "opcion_a": "int",
+        "opcion_b": "float",
+        "opcion_c": "str",
+        "opcion_d": "boolean",
+        "respuesta_correcta": "B"
+    },
+    {
+        "tema": "Operadores",
+        "pregunta": "¿Qué resultado arroja la expresión 10 % 3?",
+        "opcion_a": "3",
+        "opcion_b": "1",
+        "opcion_c": "0",
+        "opcion_d": "0.33",
+        "respuesta_correcta": "B"
+    },
+    {
+        "tema": "Condicionales",
+        "pregunta": "¿Qué estructura se usa para ejecutar código alternativo si la condición if es falsa?",
+        "opcion_a": "else",
+        "opcion_b": "elif",
+        "opcion_c": "switch",
+        "opcion_d": "except",
+        "respuesta_correcta": "A"
+    },
+    {
+        "tema": "Bucles For",
+        "pregunta": "¿Cuál es el propósito principal de un bucle for?",
+        "opcion_a": "Ejecutar código indefinidamente",
+        "opcion_b": "Iterar sobre una secuencia predefinida un número conocido de veces",
+        "opcion_c": "Evaluar una expresión lógica booleana",
+        "opcion_d": "Definir una función",
+        "respuesta_correcta": "B"
+    },
+    {
+        "tema": "Bucles While",
+        "pregunta": "¿Qué sucede si la condición de un bucle while nunca se vuelve falsa?",
+        "opcion_a": "El bucle se ejecuta una sola vez",
+        "opcion_b": "El programa compila más rápido",
+        "opcion_c": "Se produce un bucle infinito",
+        "opcion_d": "El programa lanza un error de sintaxis",
+        "respuesta_correcta": "C"
+    },
+    {
+        "tema": "Funciones",
+        "pregunta": "¿Qué palabra clave se usa para definir una función en Python?",
+        "opcion_a": "function",
+        "opcion_b": "def",
+        "opcion_c": "void",
+        "opcion_d": "define",
+        "respuesta_correcta": "B"
+    },
+    {
+        "tema": "Arrays",
+        "pregunta": "Si un arreglo/lista tiene 5 elementos, ¿cuál es el índice del último elemento?",
+        "opcion_a": "5",
+        "opcion_b": "0",
+        "opcion_c": "4",
+        "opcion_d": "-1",
+        "respuesta_correcta": "C"
+    },
+    {
+        "tema": "Objetos",
+        "pregunta": "En programación orientada a objetos, ¿qué es una clase?",
+        "opcion_a": "Una plantilla o molde para crear objetos",
+        "opcion_b": "Una variable de tipo numérico",
+        "opcion_c": "Una función que no devuelve ningún valor",
+        "opcion_d": "Una lista ordenada de elementos",
+        "respuesta_correcta": "A"
+    }
+]
+
+@app.get("/api/exam/questions")
+async def get_exam_questions(db: Session = Depends(get_db)):
+    if db.query(models.PreguntaExamen).count() == 0:
+        for q in DEFAULT_EXAM_QUESTIONS:
+            db.add(models.PreguntaExamen(**q))
+        db.commit()
+        
+    preguntas = db.query(models.PreguntaExamen).all()
+    return [
+        {
+            "id": p.id,
+            "tema": p.tema,
+            "pregunta": p.pregunta,
+            "opcion_a": p.opcion_a,
+            "opcion_b": p.opcion_b,
+            "opcion_c": p.opcion_c,
+            "opcion_d": p.opcion_d
+        } for p in preguntas
+    ]
+
+@app.post("/api/exam/submit")
+async def submit_exam(request: ExamSubmitRequest, db: Session = Depends(get_db)):
+    usuario = db.query(models.Usuario).filter(models.Usuario.id == request.usuario_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+        
+    respuestas_usuario = {r.pregunta_id: r.respuesta.upper() for r in request.respuestas}
+    preguntas = db.query(models.PreguntaExamen).filter(models.PreguntaExamen.id.in_(respuestas_usuario.keys())).all()
+    
+    all_topics = get_all_topics_from_db(db, only_approved=True)
+    
+    temas_correctos = {}
+    for p in preguntas:
+        correcta = (respuestas_usuario.get(p.id) == p.respuesta_correcta.upper())
+        if p.tema not in temas_correctos:
+            temas_correctos[p.tema] = []
+        temas_correctos[p.tema].append(correcta)
+        
+    temas_superados = []
+    for tema in all_topics:
+        resultados = temas_correctos.get(tema, [])
+        if resultados and all(resultados):
+            temas_superados.append(tema)
+        else:
+            break
+            
+    skipped_topics = len(temas_superados)
+    if skipped_topics > 0:
+        if skipped_topics < len(all_topics):
+            nuevo_tema = all_topics[skipped_topics]
+        else:
+            nuevo_tema = all_topics[-1]
+            
+        usuario.tema_actual = nuevo_tema
+        
+        ejercicios_saltados = db.query(models.Ejercicio).filter(
+            models.Ejercicio.tema.in_(temas_superados)
+        ).all()
+        
+        xp_ganada = 0
+        for ej in ejercicios_saltados:
+            diff_lower = (ej.dificultad or "fácil").lower()
+            if "fácil" in diff_lower or "facil" in diff_lower:
+                xp_ganada += 100
+            elif "media" in diff_lower or "medio" in diff_lower:
+                xp_ganada += 300
+            elif "difícil" in diff_lower or "dificil" in diff_lower:
+                xp_ganada += 500
+            else:
+                xp_ganada += 100
+                
+        if xp_ganada == 0:
+            xp_ganada = skipped_topics * 100
+            
+        usuario.xp = (usuario.xp or 0) + xp_ganada
+        usuario.nivel = 1 + int(usuario.xp / 1000)
+        
+        for ej in ejercicios_saltados:
+            resol = db.query(models.ResolucionEjercicio).filter(
+                models.ResolucionEjercicio.usuario_id == usuario.id,
+                models.ResolucionEjercicio.ejercicio_id == ej.id
+            ).first()
+            if not resol:
+                nueva_resol = models.ResolucionEjercicio(
+                    usuario_id=usuario.id,
+                    ejercicio_id=ej.id
+                )
+                db.add(nueva_resol)
+                
+        check_and_advance_empty_topics(usuario, db)
+        db.commit()
+        db.refresh(usuario)
+        
+        return {
+            "status": "success",
+            "temas_superados": temas_superados,
+            "nuevo_tema": usuario.tema_actual,
+            "xp_ganada": xp_ganada,
+            "nivel": usuario.nivel,
+            "xp": usuario.xp
+        }
+    else:
+        return {
+            "status": "fail",
+            "temas_superados": [],
+            "nuevo_tema": usuario.tema_actual,
+            "xp_ganada": 0,
+            "nivel": usuario.nivel,
+            "xp": usuario.xp
+        }
 
 
 @app.put("/api/admin/users/{user_id}")
@@ -683,6 +950,14 @@ async def upload_syllabus(
         file_content = await file.read()
         extracted_text = extract_text_from_file(file_content, file.filename)
         
+        nuevo_silabo = models.Silabo(
+            filename=file.filename,
+            contenido=extracted_text
+        )
+        db.add(nuevo_silabo)
+        db.commit()
+        db.refresh(nuevo_silabo)
+        
         ejercicios_list = []
         
         DIFY_API_KEY_DATASET = os.getenv("DIFY_API_KEY_DATASET")
@@ -798,7 +1073,7 @@ async def upload_syllabus(
                 dificultad = "Media"
                 
             tema = ej.get("tema")
-            if not tema or tema not in ["Variables", "Tipos de Datos", "Operadores", "Condicionales", "Bucles For", "Bucles While", "Funciones", "Arrays", "Objetos"]:
+            if not tema or tema not in get_all_topics_from_db(db, only_approved=False):
                 tema = categorize_exercise(titulo, descripcion)
                 
             casos_prueba_raw = ej.get("casos_prueba", "Ejecutar y validar la salida del programa.")
@@ -953,7 +1228,6 @@ async def validate_exercise(request: ValidateRequest, db: Session = Depends(get_
         if is_correct and usuario:
             check_and_advance_empty_topics(usuario, db)
             
-            # Calcular XP según la dificultad del ejercicio
             xp_ganado = 100
             if ejercicio.dificultad:
                 diff_lower = ejercicio.dificultad.lower()
@@ -969,7 +1243,17 @@ async def validate_exercise(request: ValidateRequest, db: Session = Depends(get_
             if nuevo_nivel != usuario.nivel:
                 usuario.nivel = nuevo_nivel
             
-            ejercicio.resuelto = True
+            resolucion = db.query(models.ResolucionEjercicio).filter(
+                models.ResolucionEjercicio.usuario_id == usuario.id,
+                models.ResolucionEjercicio.ejercicio_id == ejercicio.id
+            ).first()
+            if not resolucion:
+                resolucion = models.ResolucionEjercicio(
+                    usuario_id=usuario.id,
+                    ejercicio_id=ejercicio.id
+                )
+                db.add(resolucion)
+                db.commit()
             
             if ejercicio.tema.lower() == usuario.tema_actual.lower():
                 num_ejercicios = db.query(models.Ejercicio).filter(
@@ -977,10 +1261,13 @@ async def validate_exercise(request: ValidateRequest, db: Session = Depends(get_
                     models.Ejercicio.tema.ilike(usuario.tema_actual)
                 ).count()
                 
-                num_resueltos = db.query(models.Ejercicio).filter(
+                num_resueltos = db.query(models.Ejercicio).join(
+                    models.ResolucionEjercicio,
+                    models.ResolucionEjercicio.ejercicio_id == models.Ejercicio.id
+                ).filter(
                     models.Ejercicio.aprobado == True,
                     models.Ejercicio.tema.ilike(usuario.tema_actual),
-                    models.Ejercicio.resuelto == True
+                    models.ResolucionEjercicio.usuario_id == usuario.id
                 ).count()
                 
                 if num_ejercicios == 0:
@@ -989,7 +1276,7 @@ async def validate_exercise(request: ValidateRequest, db: Session = Depends(get_
                 usuario.porcentaje = num_resueltos
                 if usuario.porcentaje >= num_ejercicios:
                     usuario.porcentaje = 0
-                    all_topics = ["Variables", "Tipos de Datos", "Operadores", "Condicionales", "Bucles For", "Bucles While", "Funciones", "Arrays", "Objetos"]
+                    all_topics = get_all_topics_from_db(db, only_approved=True)
                     try:
                         idx = all_topics.index(usuario.tema_actual)
                         if idx < len(all_topics) - 1:
@@ -1048,11 +1335,24 @@ def delete_exercise(id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/exercises/{tema}")
-def get_approved_exercises_by_topic(tema: str, db: Session = Depends(get_db)):
-    return db.query(models.Ejercicio).filter(
+def get_approved_exercises_by_topic(tema: str, usuario_id: str = None, db: Session = Depends(get_db)):
+    ejercicios = db.query(models.Ejercicio).filter(
         models.Ejercicio.aprobado == True,
         models.Ejercicio.tema.ilike(tema)
     ).all()
+    
+    if usuario_id:
+        resoluciones = db.query(models.ResolucionEjercicio.ejercicio_id).filter(
+            models.ResolucionEjercicio.usuario_id == usuario_id
+        ).all()
+        resolved_ids = {r[0] for r in resoluciones}
+        for ej in ejercicios:
+            ej.resuelto = ej.id in resolved_ids
+    else:
+        for ej in ejercicios:
+            ej.resuelto = False
+            
+    return ejercicios
 
 
 @app.get("/api/exercises-counts")
@@ -1101,15 +1401,18 @@ def get_user_detailed_progress(usuario_id: str, db: Session = Depends(get_db)):
     resueltos = db.query(
         models.Ejercicio.tema, 
         func.count(models.Ejercicio.id)
+    ).join(
+        models.ResolucionEjercicio,
+        models.ResolucionEjercicio.ejercicio_id == models.Ejercicio.id
     ).filter(
         models.Ejercicio.aprobado == True,
-        models.Ejercicio.resuelto == True
+        models.ResolucionEjercicio.usuario_id == usuario_id
     ).group_by(models.Ejercicio.tema).all()
     
     totales_dict = {t[0]: t[1] for t in totales}
     resueltos_dict = {r[0]: r[1] for r in resueltos}
     
-    all_topics = ["Variables", "Tipos de Datos", "Operadores", "Condicionales", "Bucles For", "Bucles While", "Funciones", "Arrays", "Objetos"]
+    all_topics = get_all_topics_from_db(db, only_approved=True)
     
     progress_data = []
     for topic in all_topics:
