@@ -14,6 +14,7 @@ class ChatResponse(BaseModel):
     respuesta: str
     dify_conversation_id: str
     status: str
+    agente_nombre: Optional[str] = None
 
 class PistonFile(BaseModel):
     name: str
@@ -89,4 +90,10 @@ class AnswerItem(BaseModel):
 class ExamSubmitRequest(BaseModel):
     usuario_id: str
     respuestas: List[AnswerItem]
+
+
+class GoogleAuthRequest(BaseModel):
+    email: str
+    name: str
+    uid: str
 

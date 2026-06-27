@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, LargeBinary
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
 
@@ -72,6 +72,7 @@ class Silabo(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     filename = Column(String(255), nullable=False)
     contenido = Column(Text, nullable=False)
+    file_data = Column(LargeBinary, nullable=True)
     fecha_subida = Column(DateTime, default=datetime.utcnow)
 
 

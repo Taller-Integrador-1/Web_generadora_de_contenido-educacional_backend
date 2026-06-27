@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.config.database import engine, get_db
@@ -7,7 +7,7 @@ from app.schemas.schemas import (
     ChatRequest, ChatResponse, ExecuteRequest,
     LoginRequest, RegisterRequest, LoginResponse, UserUpdate,
     EjercicioResponse, ValidateRequest, ProfileUpdateRequest,
-    ExamSubmitRequest
+    ExamSubmitRequest, GoogleAuthRequest
 )
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.dify_service import DifyService
@@ -31,6 +31,7 @@ try:
         conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS porcentaje INTEGER DEFAULT 0;"))
         conn.execute(text("ALTER TABLE ejercicios ADD COLUMN IF NOT EXISTS casos_prueba TEXT;"))
         conn.execute(text("ALTER TABLE ejercicios ADD COLUMN IF NOT EXISTS resuelto BOOLEAN DEFAULT FALSE;"))
+        conn.execute(text("ALTER TABLE silabos ADD COLUMN IF NOT EXISTS file_data BYTEA;"))
         conn.commit()
     print("[Migraciones] Columnas migradas o ya existentes.")
 except Exception as e:
@@ -110,27 +111,11 @@ dify_service = DifyService()
 @app.post("/api/chat", response_model=ChatResponse)
 async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
     try:
-        inputs_dify = {
-            "ejercicio_titulo": request.ejercicio_titulo or "",
-            "ejercicio_descripcion": request.ejercicio_descripcion or ""
-        }
-
-        query_completa = request.mensaje
-
-        resultado_dify = dify_service.enviar_mensaje(
-            query=query_completa,
-            user_id=request.usuario_id,
-            conversation_id=request.dify_conversation_id,
-            inputs=inputs_dify
-        )
+        import uuid
+        from app.services.agents import compiled_graph
         
-        respuesta_juez = resultado_dify.get("answer")
-        nuevo_conv_id = resultado_dify.get("conversation_id")
+        nuevo_conv_id = request.dify_conversation_id or str(uuid.uuid4())
         
-        intento_fraude = 0
-        if respuesta_juez and ("Reescribe la respuesta eliminando el código" in respuesta_juez or "No puedo proporcionarte código" in respuesta_juez):
-            intento_fraude = 1
-            
         usuario = db.query(models.Usuario).filter(models.Usuario.id == request.usuario_id).first()
         if not usuario:
             usuario = models.Usuario(
@@ -155,6 +140,45 @@ async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
             db.commit()
             db.refresh(sesion)
 
+        messages_for_graph = []
+        if sesion:
+            past_messages = db.query(models.MensajeLog).filter(models.MensajeLog.sesion_id == sesion.id).order_by(models.MensajeLog.fecha.asc()).all()
+            for m in past_messages:
+                messages_for_graph.append({
+                    "role": "user" if m.rol == "user" else "assistant",
+                    "content": m.contenido
+                })
+                
+        messages_for_graph.append({
+            "role": "user",
+            "content": request.mensaje
+        })
+
+        silabo = db.query(models.Silabo).order_by(models.Silabo.fecha_subida.desc()).first()
+        syllabus_text = silabo.contenido if silabo else "No hay un sílabo cargado en el sistema actualmente."
+
+        inputs = {
+            "messages": messages_for_graph,
+            "usuario_id": request.usuario_id,
+            "code": request.codigo_alumno or "",
+            "exercise_title": request.ejercicio_titulo or "",
+            "exercise_desc": request.ejercicio_descripcion or "",
+            "technical_analysis": "",
+            "pedagogical_context": syllabus_text,
+            "final_response": "",
+            "next_agent": "",
+            "active_agent": "Tutor Inteligente"
+        }
+        
+        config = {"configurable": {"thread_id": nuevo_conv_id}}
+        result = compiled_graph.invoke(inputs, config=config)
+        respuesta_juez = result.get("final_response", "Lo siento, no pude procesar la consulta.")
+        nombre_agente = result.get("active_agent", "Tutor Inteligente")
+
+        intento_fraude = 0
+        if respuesta_juez and ("Reescribe la respuesta eliminando el código" in respuesta_juez or "No puedo proporcionarte código" in respuesta_juez):
+            intento_fraude = 1
+
         msg_user = models.MensajeLog(
             sesion_id=sesion.id,
             rol="user",
@@ -176,10 +200,12 @@ async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
         return ChatResponse(
             respuesta=respuesta_juez,
             dify_conversation_id=nuevo_conv_id,
-            status="success"
+            status="success",
+            agente_nombre=nombre_agente
         )
         
     except Exception as e:
+        print(f"[Chat Processing Error] {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/execute")
@@ -409,6 +435,57 @@ async def login_usuario(request: LoginRequest, db: Session = Depends(get_db)):
     )
 
 
+@app.post("/api/auth/google", response_model=LoginResponse)
+async def auth_google(request: GoogleAuthRequest, db: Session = Depends(get_db)):
+    try:
+        usuario = db.query(models.Usuario).filter(models.Usuario.correo == request.email).first()
+        
+        if not usuario:
+            prefix = request.email.split("@")[0]
+            import re
+            user_id = re.sub(r'[^a-zA-Z0-9_]', '', prefix)
+            
+            if not user_id:
+                user_id = f"user_{request.uid[:8]}"
+            else:
+                existing = db.query(models.Usuario).filter(models.Usuario.id == user_id).first()
+                if existing:
+                    user_id = f"{user_id}_{request.uid[:4]}"
+            
+            usuario = models.Usuario(
+                id=user_id,
+                nombre=request.name,
+                correo=request.email,
+                contrasena=hash_password("google_oauth_bypass"),
+                rol="student",
+                xp=0,
+                nivel=1,
+                tema_actual="Variables",
+                porcentaje=0
+            )
+            db.add(usuario)
+            db.commit()
+            db.refresh(usuario)
+        
+        check_and_advance_empty_topics(usuario, db)
+        
+        return LoginResponse(
+            usuario_id=usuario.id,
+            nombre=usuario.nombre,
+            correo=usuario.correo,
+            rol=usuario.rol or "student",
+            xp=usuario.xp or 0,
+            nivel=usuario.nivel or 1,
+            tema_actual=usuario.tema_actual or "Variables",
+            porcentaje=usuario.porcentaje or 0,
+            status="success"
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"[Google Auth Error] {e}")
+        raise HTTPException(status_code=500, detail=f"Error al autenticar con Google: {str(e)}")
+
+
 @app.get("/api/chat/history/{usuario_id}")
 async def obtener_historial_chat(usuario_id: str, db: Session = Depends(get_db)):
     sesion = db.query(models.SesionChat)\
@@ -463,6 +540,125 @@ async def get_dify_documents():
         return {"documents": [], "error": str(e)}
 
 
+def normalize_filename(filename: str) -> str:
+    if not filename:
+        return ""
+    base_name = os.path.splitext(filename)[0]
+    nfkd_form = unicodedata.normalize('NFKD', base_name)
+    only_ascii = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+    clean = re.sub(r'[^a-zA-Z0-9]', '', only_ascii).lower()
+    return clean
+
+
+@app.get("/api/admin/dify-documents/{document_id}/content")
+async def get_dify_document_content(document_id: str, db: Session = Depends(get_db)):
+    DIFY_API_KEY_DATASET = os.getenv("DIFY_API_KEY_DATASET")
+    DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID")
+    
+    if not DIFY_API_KEY_DATASET or not DIFY_DATASET_ID or "placeholder" in DIFY_API_KEY_DATASET:
+        return {"document_id": document_id, "has_binary": False, "content": ""}
+        
+    try:
+        url = f"https://api.dify.ai/v1/datasets/{DIFY_DATASET_ID}/documents"
+        headers = {
+            "Authorization": f"Bearer {DIFY_API_KEY_DATASET}"
+        }
+        r = requests.get(url, headers=headers, params={"limit": 100}, timeout=15)
+        r.raise_for_status()
+        docs = r.json().get("data", [])
+        
+        doc_name = None
+        for d in docs:
+            if d.get("id") == document_id:
+                doc_name = d.get("name")
+                break
+                
+        has_binary = False
+        if doc_name:
+            norm_doc = normalize_filename(doc_name)
+            all_silabos = db.query(models.Silabo).all()
+            for s in all_silabos:
+                if normalize_filename(s.filename) == norm_doc and s.file_data:
+                    has_binary = True
+                    break
+                
+        segments_url = f"https://api.dify.ai/v1/datasets/{DIFY_DATASET_ID}/documents/{document_id}/segments"
+        segments = []
+        page = 1
+        limit = 100
+        while True:
+            r = requests.get(segments_url, headers=headers, params={"limit": limit, "page": page}, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            page_segments = data.get("data", [])
+            segments.extend(page_segments)
+            has_more = data.get("has_more", False)
+            if not has_more or len(page_segments) < limit:
+                break
+            page += 1
+            
+        segments.sort(key=lambda s: s.get("position", 0))
+        full_content = "\n\n".join([s.get("content", "") for s in segments if s.get("content")])
+        
+        return {"document_id": document_id, "has_binary": has_binary, "content": full_content}
+        
+    except Exception as e:
+        print(f"[Dify Document Content Error] {e}")
+        return {"document_id": document_id, "has_binary": False, "content": ""}
+
+
+@app.get("/api/admin/dify-documents/{document_id}/view")
+async def view_dify_document_binary(document_id: str, db: Session = Depends(get_db)):
+    DIFY_API_KEY_DATASET = os.getenv("DIFY_API_KEY_DATASET")
+    DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID")
+    
+    if not DIFY_API_KEY_DATASET or not DIFY_DATASET_ID or "placeholder" in DIFY_API_KEY_DATASET:
+        raise HTTPException(status_code=400, detail="Faltan credenciales del dataset de Dify.")
+        
+    try:
+        url = f"https://api.dify.ai/v1/datasets/{DIFY_DATASET_ID}/documents"
+        headers = {
+            "Authorization": f"Bearer {DIFY_API_KEY_DATASET}"
+        }
+        r = requests.get(url, headers=headers, params={"limit": 100}, timeout=15)
+        r.raise_for_status()
+        docs = r.json().get("data", [])
+        
+        doc_name = None
+        for d in docs:
+            if d.get("id") == document_id:
+                doc_name = d.get("name")
+                break
+                
+        if not doc_name:
+            raise HTTPException(status_code=404, detail="Documento no encontrado en Dify.")
+            
+        silabo = None
+        if doc_name:
+            norm_doc = normalize_filename(doc_name)
+            all_silabos = db.query(models.Silabo).order_by(models.Silabo.fecha_subida.desc()).all()
+            for s in all_silabos:
+                if normalize_filename(s.filename) == norm_doc and s.file_data:
+                    silabo = s
+                    break
+            
+        if not silabo:
+            raise HTTPException(status_code=404, detail="Archivo binario no disponible localmente.")
+            
+        media_type = "application/pdf"
+        if silabo.filename.endswith(".docx"):
+            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        elif silabo.filename.endswith(".doc"):
+            media_type = "application/msword"
+            
+        return Response(content=silabo.file_data, media_type=media_type)
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/admin/syllabus")
 async def get_active_syllabus(db: Session = Depends(get_db)):
     silabo = db.query(models.Silabo).order_by(models.Silabo.fecha_subida.desc()).first()
@@ -493,25 +689,25 @@ async def get_all_students(db: Session = Depends(get_db)):
 DEFAULT_EXAM_QUESTIONS = [
     {
         "tema": "Variables",
-        "pregunta": "¿Cuál de las siguientes declaraciones de variables en Python es válida?",
-        "opcion_a": "1_variable = 5",
-        "opcion_b": "variable-uno = 5",
-        "opcion_c": "variable_uno = 5",
-        "opcion_d": "class = 5",
+        "pregunta": "¿Cuál de las siguientes declaraciones de variables en Java es válida?",
+        "opcion_a": "int 1variable = 5;",
+        "opcion_b": "int variable-uno = 5;",
+        "opcion_c": "int variable_uno = 5;",
+        "opcion_d": "int class = 5;",
         "respuesta_correcta": "C"
     },
     {
         "tema": "Tipos de Datos",
-        "pregunta": "¿Cuál es el tipo de datos del valor 3.1416?",
-        "opcion_a": "int",
-        "opcion_b": "float",
-        "opcion_c": "str",
+        "pregunta": "¿Qué tipo de dato primitivo se utiliza en Java para representar números decimales literales como 3.1416 por defecto?",
+        "opcion_a": "float",
+        "opcion_b": "double",
+        "opcion_c": "String",
         "opcion_d": "boolean",
         "respuesta_correcta": "B"
     },
     {
         "tema": "Operadores",
-        "pregunta": "¿Qué resultado arroja la expresión 10 % 3?",
+        "pregunta": "¿Qué resultado arroja la expresión 10 % 3 en Java?",
         "opcion_a": "3",
         "opcion_b": "1",
         "opcion_c": "0",
@@ -520,62 +716,67 @@ DEFAULT_EXAM_QUESTIONS = [
     },
     {
         "tema": "Condicionales",
-        "pregunta": "¿Qué estructura se usa para ejecutar código alternativo si la condición if es falsa?",
-        "opcion_a": "else",
-        "opcion_b": "elif",
-        "opcion_c": "switch",
-        "opcion_d": "except",
+        "pregunta": "En Java, ¿qué estructura condicional se utiliza para evaluar múltiples casos posibles para una misma variable?",
+        "opcion_a": "switch",
+        "opcion_b": "if-else",
+        "opcion_c": "try-catch",
+        "opcion_d": "for",
         "respuesta_correcta": "A"
     },
     {
         "tema": "Bucles For",
-        "pregunta": "¿Cuál es el propósito principal de un bucle for?",
-        "opcion_a": "Ejecutar código indefinidamente",
-        "opcion_b": "Iterar sobre una secuencia predefinida un número conocido de veces",
-        "opcion_c": "Evaluar una expresión lógica booleana",
-        "opcion_d": "Definir una función",
-        "respuesta_correcta": "B"
+        "pregunta": "En Java, ¿cuál de las siguientes sintaxis de bucle for es válida para iterar 5 veces?",
+        "opcion_a": "for (int i = 0; i < 5; i++)",
+        "opcion_b": "for (i = 0; i < 5; i++)",
+        "opcion_c": "for int i = 0 to 5",
+        "opcion_d": "for (int i = 0; i <= 5)",
+        "respuesta_correcta": "A"
     },
     {
         "tema": "Bucles While",
-        "pregunta": "¿Qué sucede si la condición de un bucle while nunca se vuelve falsa?",
+        "pregunta": "¿Qué sucede si la condición de un bucle while en Java nunca se vuelve falsa?",
         "opcion_a": "El bucle se ejecuta una sola vez",
         "opcion_b": "El programa compila más rápido",
         "opcion_c": "Se produce un bucle infinito",
-        "opcion_d": "El programa lanza un error de sintaxis",
+        "opcion_d": "El compilador genera un error de sintaxis",
         "respuesta_correcta": "C"
     },
     {
         "tema": "Funciones",
-        "pregunta": "¿Qué palabra clave se usa para definir una función en Python?",
-        "opcion_a": "function",
-        "opcion_b": "def",
-        "opcion_c": "void",
-        "opcion_d": "define",
-        "respuesta_correcta": "B"
+        "pregunta": "¿Cómo se declara un método/función en Java que no devuelve ningún valor?",
+        "opcion_a": "public void miMetodo()",
+        "opcion_b": "public def miMetodo()",
+        "opcion_c": "public function miMetodo()",
+        "opcion_d": "public null miMetodo()",
+        "respuesta_correcta": "A"
     },
     {
         "tema": "Arrays",
-        "pregunta": "Si un arreglo/lista tiene 5 elementos, ¿cuál es el índice del último elemento?",
-        "opcion_a": "5",
-        "opcion_b": "0",
-        "opcion_c": "4",
-        "opcion_d": "-1",
-        "respuesta_correcta": "C"
+        "pregunta": "En Java, ¿cómo se obtiene la longitud (número de elementos) de un arreglo llamado 'miArreglo'?",
+        "opcion_a": "miArreglo.length()",
+        "opcion_b": "miArreglo.length",
+        "opcion_c": "miArreglo.size()",
+        "opcion_d": "len(miArreglo)",
+        "respuesta_correcta": "B"
     },
     {
         "tema": "Objetos",
-        "pregunta": "En programación orientada a objetos, ¿qué es una clase?",
-        "opcion_a": "Una plantilla o molde para crear objetos",
-        "opcion_b": "Una variable de tipo numérico",
-        "opcion_c": "Una función que no devuelve ningún valor",
-        "opcion_d": "Una lista ordenada de elementos",
-        "respuesta_correcta": "A"
+        "pregunta": "En Java, ¿qué palabra clave se utiliza para instanciar un objeto a partir de una clase?",
+        "opcion_a": "create",
+        "opcion_b": "make",
+        "opcion_c": "new",
+        "opcion_d": "instance",
+        "respuesta_correcta": "C"
     }
 ]
 
 @app.get("/api/exam/questions")
 async def get_exam_questions(db: Session = Depends(get_db)):
+    has_python_q = db.query(models.PreguntaExamen).filter(models.PreguntaExamen.pregunta.like("%Python%")).first()
+    if has_python_q:
+        db.query(models.PreguntaExamen).delete()
+        db.commit()
+
     if db.query(models.PreguntaExamen).count() == 0:
         for q in DEFAULT_EXAM_QUESTIONS:
             db.add(models.PreguntaExamen(**q))
@@ -952,7 +1153,8 @@ async def upload_syllabus(
         
         nuevo_silabo = models.Silabo(
             filename=file.filename,
-            contenido=extracted_text
+            contenido=extracted_text,
+            file_data=file_content
         )
         db.add(nuevo_silabo)
         db.commit()

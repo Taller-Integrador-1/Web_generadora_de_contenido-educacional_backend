@@ -6,7 +6,9 @@ dotenv.load_dotenv()
 
 class DifyService:
     def __init__(self, api_key: str = None, base_url: str = "https://api.dify.ai/v1"):
-        api_key = api_key or os.getenv("DIFY_API_KEY_TUTOR", "app-5pkVOhLwCB5yF0NnMiUlhi8J")
+        api_key = api_key or os.getenv("DIFY_API_KEY_TUTOR")
+        if not api_key:
+            raise ValueError("Falta la variable de entorno DIFY_API_KEY_TUTOR en el archivo .env")
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
