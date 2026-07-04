@@ -7,7 +7,7 @@ from app.schemas.schemas import (
     ChatRequest, ChatResponse, ExecuteRequest,
     LoginRequest, RegisterRequest, LoginResponse, UserUpdate,
     EjercicioResponse, ValidateRequest, ProfileUpdateRequest,
-    ExamSubmitRequest, GoogleAuthRequest
+    ExamSubmitRequest, GoogleAuthRequest, XPDeductRequest, XPDeductResponse
 )
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.dify_service import DifyService
@@ -1661,6 +1661,27 @@ def update_user_profile(usuario_id: str, request: ProfileUpdateRequest, db: Sess
             "porcentaje": usuario.porcentaje or 0
         }
     }
+
+
+@app.post("/api/usuario/descontar-xp", response_model=XPDeductResponse)
+def descontar_xp(request: XPDeductRequest, db: Session = Depends(get_db)):
+    usuario = db.query(models.Usuario).filter(models.Usuario.id == request.usuario_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        
+    usuario.xp = max(0, (usuario.xp or 0) - request.descuento_xp)
+    
+    nuevo_nivel = (usuario.xp // 1000) + 1
+    usuario.nivel = nuevo_nivel
+    
+    db.commit()
+    db.refresh(usuario)
+    
+    return XPDeductResponse(
+        xp=usuario.xp,
+        nivel=usuario.nivel,
+        status="success"
+    )
 
 
 

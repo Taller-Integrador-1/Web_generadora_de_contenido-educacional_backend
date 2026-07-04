@@ -97,3 +97,14 @@ class GoogleAuthRequest(BaseModel):
     name: str
     uid: str
 
+
+class XPDeductRequest(BaseModel):
+    usuario_id: str
+    descuento_xp: int
+
+
+class XPDeductResponse(BaseModel):
+    xp: int
+    nivel: int
+    status: str
+
