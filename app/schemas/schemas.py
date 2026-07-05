@@ -9,6 +9,7 @@ class ChatRequest(BaseModel):
     ejercicio_descripcion: Optional[str] = None
     codigo_alumno: Optional[str] = None
     tutor_level: Optional[str] = None
+    pista_numero: Optional[int] = None
 
 class ChatResponse(BaseModel):
     respuesta: str

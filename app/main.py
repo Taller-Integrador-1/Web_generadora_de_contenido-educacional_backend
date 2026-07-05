@@ -163,6 +163,7 @@ async def procesar_chat(request: ChatRequest, db: Session = Depends(get_db)):
             "code": request.codigo_alumno or "",
             "exercise_title": request.ejercicio_titulo or "",
             "exercise_desc": request.ejercicio_descripcion or "",
+            "pista_numero": request.pista_numero,
             "technical_analysis": "",
             "pedagogical_context": syllabus_text,
             "final_response": "",
