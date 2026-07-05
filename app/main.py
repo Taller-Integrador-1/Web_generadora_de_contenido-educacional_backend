@@ -233,7 +233,7 @@ def proxy_execute_code(request: ExecuteRequest):
                 try:
                     result = subprocess.run(
                         ["python3", main_file], 
-                        cwd=temp_dir, capture_output=True, text=True, timeout=5
+                        cwd=temp_dir, capture_output=True, text=True, timeout=15
                     )
                     return {
                         "run": {
@@ -244,13 +244,13 @@ def proxy_execute_code(request: ExecuteRequest):
                         }
                     }
                 except subprocess.TimeoutExpired:
-                    return {"run": {"stdout": "", "stderr": "Error: Tiempo límite de ejecución excedido (5s).", "code": 1}}
+                    return {"run": {"stdout": "", "stderr": "Error: Tiempo límite de ejecución excedido (15s).", "code": 1}}
             
             elif request.language == "java":
                 try:
                     compile_result = subprocess.run(
                         ["javac", main_file], 
-                        cwd=temp_dir, capture_output=True, text=True, timeout=5
+                        cwd=temp_dir, capture_output=True, text=True, timeout=15
                     )
                     if compile_result.returncode != 0:
                         return {"compile": {"stderr": compile_result.stderr}, "run": {"code": 1}}
@@ -258,7 +258,7 @@ def proxy_execute_code(request: ExecuteRequest):
                     class_name = main_file.replace(".java", "")
                     result = subprocess.run(
                         ["java", class_name], 
-                        cwd=temp_dir, capture_output=True, text=True, timeout=5
+                        cwd=temp_dir, capture_output=True, text=True, timeout=15
                     )
                     return {
                         "run": {
@@ -269,7 +269,7 @@ def proxy_execute_code(request: ExecuteRequest):
                         }
                     }
                 except subprocess.TimeoutExpired:
-                    return {"run": {"stdout": "", "stderr": "Error: Tiempo límite de ejecución excedido (5s).", "code": 1}}
+                    return {"run": {"stdout": "", "stderr": "Error: Tiempo límite de ejecución excedido (15s).", "code": 1}}
             
             else:
                 return {"compile": {"stderr": f"Lenguaje no soportado: {request.language}"}, "run": {"code": 1}}
