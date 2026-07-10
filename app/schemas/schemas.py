@@ -46,6 +46,7 @@ class LoginResponse(BaseModel):
     tema_actual: str
     porcentaje: int
     status: str
+    examen_completado: bool = False
 
 class UserUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -65,6 +66,8 @@ class EjercicioResponse(BaseModel):
     casos_prueba: Optional[str] = None
     aprobado: bool
     resuelto: bool = False
+    codigo_resuelto: Optional[str] = None
+    lenguaje: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -75,6 +78,7 @@ class ValidateRequest(BaseModel):
     ejercicio_id: int
     resolucion_codigo: str
     resultado_consola: str
+    lenguaje: Optional[str] = None
 
 
 class ProfileUpdateRequest(BaseModel):

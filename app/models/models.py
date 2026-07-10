@@ -16,6 +16,7 @@ class Usuario(Base):
     nivel = Column(Integer, default=1)
     tema_actual = Column(String(100), default="Variables")
     porcentaje = Column(Integer, default=0)
+    examen_completado = Column(Boolean, default=False)
     
     sesiones = relationship("SesionChat", back_populates="usuario")
 
@@ -63,6 +64,8 @@ class ResolucionEjercicio(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     usuario_id = Column(String(50), ForeignKey("usuarios.id"), nullable=False)
     ejercicio_id = Column(Integer, ForeignKey("ejercicios.id"), nullable=False)
+    codigo_resuelto = Column(Text, nullable=True)
+    lenguaje = Column(String(20), nullable=True)
     fecha_resolucion = Column(DateTime, default=datetime.utcnow)
 
 

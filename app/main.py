@@ -29,9 +29,12 @@ try:
         conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nivel INTEGER DEFAULT 1;"))
         conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS tema_actual VARCHAR(100) DEFAULT 'Variables';"))
         conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS porcentaje INTEGER DEFAULT 0;"))
+        conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS examen_completado BOOLEAN DEFAULT FALSE;"))
         conn.execute(text("ALTER TABLE ejercicios ADD COLUMN IF NOT EXISTS casos_prueba TEXT;"))
         conn.execute(text("ALTER TABLE ejercicios ADD COLUMN IF NOT EXISTS resuelto BOOLEAN DEFAULT FALSE;"))
         conn.execute(text("ALTER TABLE silabos ADD COLUMN IF NOT EXISTS file_data BYTEA;"))
+        conn.execute(text("ALTER TABLE resoluciones_ejercicios ADD COLUMN IF NOT EXISTS codigo_resuelto TEXT;"))
+        conn.execute(text("ALTER TABLE resoluciones_ejercicios ADD COLUMN IF NOT EXISTS lenguaje VARCHAR(20);"))
         conn.commit()
     print("[Migraciones] Columnas migradas o ya existentes.")
 except Exception as e:
@@ -231,9 +234,13 @@ def proxy_execute_code(request: ExecuteRequest):
 
             if request.language == "python":
                 try:
+                    import copy
+                    python_env = copy.deepcopy(os.environ)
+                    python_env["PYTHONIOENCODING"] = "utf-8"
                     result = subprocess.run(
                         ["python3", main_file], 
-                        cwd=temp_dir, capture_output=True, text=True, timeout=15
+                        cwd=temp_dir, capture_output=True, timeout=15,
+                        encoding="utf-8", errors="replace", env=python_env
                     )
                     return {
                         "run": {
@@ -249,16 +256,18 @@ def proxy_execute_code(request: ExecuteRequest):
             elif request.language == "java":
                 try:
                     compile_result = subprocess.run(
-                        ["javac", main_file], 
-                        cwd=temp_dir, capture_output=True, text=True, timeout=15
+                        ["javac", "-encoding", "utf-8", main_file], 
+                        cwd=temp_dir, capture_output=True, timeout=15,
+                        encoding="utf-8", errors="replace"
                     )
                     if compile_result.returncode != 0:
                         return {"compile": {"stderr": compile_result.stderr}, "run": {"code": 1}}
                     
                     class_name = main_file.replace(".java", "")
                     result = subprocess.run(
-                        ["java", class_name], 
-                        cwd=temp_dir, capture_output=True, text=True, timeout=15
+                        ["java", "-Dfile.encoding=UTF-8", class_name], 
+                        cwd=temp_dir, capture_output=True, timeout=15,
+                        encoding="utf-8", errors="replace"
                     )
                     return {
                         "run": {
@@ -370,7 +379,13 @@ def check_and_advance_empty_topics(usuario: models.Usuario, db: Session):
 
 @app.post("/api/register", response_model=LoginResponse)
 async def registrar_usuario(request: RegisterRequest, db: Session = Depends(get_db)):
-    existe_usuario = db.query(models.Usuario).filter(models.Usuario.id == request.usuario_id).first()
+    code = request.usuario_id.strip()
+    if not re.match(r"^\d{9}$", code):
+        raise HTTPException(status_code=400, detail="El código de estudiante debe constar de exactamente 9 dígitos numéricos.")
+    if len(set(code)) == 1:
+        raise HTTPException(status_code=400, detail="El código de estudiante no puede estar formado por el mismo dígito repetido.")
+        
+    existe_usuario = db.query(models.Usuario).filter(models.Usuario.id == code).first()
     if existe_usuario:
         raise HTTPException(status_code=400, detail="El código de estudiante ya está registrado.")
     
@@ -379,7 +394,7 @@ async def registrar_usuario(request: RegisterRequest, db: Session = Depends(get_
         raise HTTPException(status_code=400, detail="El correo electrónico ya está registrado.")
     
     nuevo_usuario = models.Usuario(
-        id=request.usuario_id,
+        id=code,
         nombre=request.nombre,
         correo=request.correo,
         contrasena=hash_password(request.contrasena),
@@ -403,7 +418,8 @@ async def registrar_usuario(request: RegisterRequest, db: Session = Depends(get_
             nivel=nuevo_usuario.nivel,
             tema_actual=nuevo_usuario.tema_actual,
             porcentaje=nuevo_usuario.porcentaje,
-            status="success"
+            status="success",
+            examen_completado=nuevo_usuario.examen_completado or False
         )
     except Exception as e:
         db.rollback()
@@ -412,7 +428,14 @@ async def registrar_usuario(request: RegisterRequest, db: Session = Depends(get_
 
 @app.post("/api/login", response_model=LoginResponse)
 async def login_usuario(request: LoginRequest, db: Session = Depends(get_db)):
-    usuario = db.query(models.Usuario).filter(models.Usuario.id == request.usuario_id).first()
+    usuario_id = request.usuario_id.strip()
+    if usuario_id.isdigit():
+        if len(usuario_id) != 9:
+            raise HTTPException(status_code=400, detail="El código de estudiante debe constar de exactamente 9 dígitos.")
+        if len(set(usuario_id)) == 1:
+            raise HTTPException(status_code=400, detail="El código de estudiante no puede estar formado por el mismo dígito repetido.")
+            
+    usuario = db.query(models.Usuario).filter(models.Usuario.id == usuario_id).first()
     if not usuario:
         usuario = db.query(models.Usuario).filter(models.Usuario.correo == request.usuario_id).first()
         if not usuario:
@@ -432,7 +455,8 @@ async def login_usuario(request: LoginRequest, db: Session = Depends(get_db)):
         nivel=usuario.nivel or 1,
         tema_actual=usuario.tema_actual or "Variables",
         porcentaje=usuario.porcentaje or 0,
-        status="success"
+        status="success",
+        examen_completado=usuario.examen_completado or False
     )
 
 
@@ -479,7 +503,8 @@ async def auth_google(request: GoogleAuthRequest, db: Session = Depends(get_db))
             nivel=usuario.nivel or 1,
             tema_actual=usuario.tema_actual or "Variables",
             porcentaje=usuario.porcentaje or 0,
-            status="success"
+            status="success",
+            examen_completado=usuario.examen_completado or False
         )
     except Exception as e:
         db.rollback()
@@ -807,9 +832,14 @@ async def submit_exam(request: ExamSubmitRequest, db: Session = Depends(get_db))
     
     all_topics = get_all_topics_from_db(db, only_approved=True)
     
+    aciertos = 0
+    total_preguntas = len(preguntas)
+    
     temas_correctos = {}
     for p in preguntas:
         correcta = (respuestas_usuario.get(p.id) == p.respuesta_correcta.upper())
+        if correcta:
+            aciertos += 1
         if p.tema not in temas_correctos:
             temas_correctos[p.tema] = []
         temas_correctos[p.tema].append(correcta)
@@ -865,6 +895,7 @@ async def submit_exam(request: ExamSubmitRequest, db: Session = Depends(get_db))
                 )
                 db.add(nueva_resol)
                 
+        usuario.examen_completado = True
         check_and_advance_empty_topics(usuario, db)
         db.commit()
         db.refresh(usuario)
@@ -875,16 +906,24 @@ async def submit_exam(request: ExamSubmitRequest, db: Session = Depends(get_db))
             "nuevo_tema": usuario.tema_actual,
             "xp_ganada": xp_ganada,
             "nivel": usuario.nivel,
-            "xp": usuario.xp
+            "xp": usuario.xp,
+            "aciertos": aciertos,
+            "total_preguntas": total_preguntas
         }
     else:
+        usuario.examen_completado = True
+        db.commit()
+        db.refresh(usuario)
+        
         return {
             "status": "fail",
             "temas_superados": [],
             "nuevo_tema": usuario.tema_actual,
             "xp_ganada": 0,
             "nivel": usuario.nivel,
-            "xp": usuario.xp
+            "xp": usuario.xp,
+            "aciertos": aciertos,
+            "total_preguntas": total_preguntas
         }
 
 
@@ -1058,17 +1097,17 @@ def generate_initial_codes(titulo: str, casos_prueba) -> tuple:
         java_func_name = "miFuncion"
         
     if ret_type == "void":
-        java_code = f"public class Main {{\n    public static void {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n    }}\n}}"
+        java_code = f"public class Main {{\n    public static void main(String[] args) {{\n        // Puedes probar tu código aquí\n    }}\n\n    public static void {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n    }}\n}}"
     elif ret_type == "boolean":
-        java_code = f"public class Main {{\n    public static boolean {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return false;\n    }}\n}}"
+        java_code = f"public class Main {{\n    public static void main(String[] args) {{\n        // Puedes probar tu código aquí\n    }}\n\n    public static boolean {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return false;\n    }}\n}}"
     elif ret_type == "int":
-        java_code = f"public class Main {{\n    public static int {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return 0;\n    }}\n}}"
+        java_code = f"public class Main {{\n    public static void main(String[] args) {{\n        // Puedes probar tu código aquí\n    }}\n\n    public static int {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return 0;\n    }}\n}}"
     elif ret_type == "double":
-        java_code = f"public class Main {{\n    public static double {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return 0.0;\n    }}\n}}"
+        java_code = f"public class Main {{\n    public static void main(String[] args) {{\n        // Puedes probar tu código aquí\n    }}\n\n    public static double {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return 0.0;\n    }}\n}}"
     elif ret_type == "String":
-        java_code = f"public class Main {{\n    public static String {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return \"\";\n    }}\n}}"
+        java_code = f"public class Main {{\n    public static void main(String[] args) {{\n        // Puedes probar tu código aquí\n    }}\n\n    public static String {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return \"\";\n    }}\n}}"
     else:
-        java_code = f"import java.util.*;\n\npublic class Main {{\n    public static {ret_type} {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return null;\n    }}\n}}"
+        java_code = f"import java.util.*;\n\npublic class Main {{\n    public static void main(String[] args) {{\n        // Puedes probar tu código aquí\n    }}\n\n    public static {ret_type} {java_func_name}({java_params}) {{\n        // Escribe tu código aquí\n        return null;\n    }}\n}}"
 
     return py_code, java_code
 
@@ -1453,10 +1492,15 @@ async def validate_exercise(request: ValidateRequest, db: Session = Depends(get_
             if not resolucion:
                 resolucion = models.ResolucionEjercicio(
                     usuario_id=usuario.id,
-                    ejercicio_id=ejercicio.id
+                    ejercicio_id=ejercicio.id,
+                    codigo_resuelto=request.resolucion_codigo,
+                    lenguaje=request.lenguaje
                 )
                 db.add(resolucion)
-                db.commit()
+            else:
+                resolucion.codigo_resuelto = request.resolucion_codigo
+                resolucion.lenguaje = request.lenguaje
+            db.commit()
             
             if ejercicio.tema.lower() == usuario.tema_actual.lower():
                 num_ejercicios = db.query(models.Ejercicio).filter(
@@ -1545,15 +1589,25 @@ def get_approved_exercises_by_topic(tema: str, usuario_id: str = None, db: Sessi
     ).all()
     
     if usuario_id:
-        resoluciones = db.query(models.ResolucionEjercicio.ejercicio_id).filter(
+        resoluciones = db.query(models.ResolucionEjercicio).filter(
             models.ResolucionEjercicio.usuario_id == usuario_id
         ).all()
-        resolved_ids = {r[0] for r in resoluciones}
+        resol_map = {r.ejercicio_id: r for r in resoluciones}
         for ej in ejercicios:
-            ej.resuelto = ej.id in resolved_ids
+            r = resol_map.get(ej.id)
+            if r:
+                ej.resuelto = True
+                ej.codigo_resuelto = r.codigo_resuelto
+                ej.lenguaje = r.lenguaje
+            else:
+                ej.resuelto = False
+                ej.codigo_resuelto = None
+                ej.lenguaje = None
     else:
         for ej in ejercicios:
             ej.resuelto = False
+            ej.codigo_resuelto = None
+            ej.lenguaje = None
             
     return ejercicios
 
@@ -1585,7 +1639,8 @@ def get_user_stats(usuario_id: str, db: Session = Depends(get_db)):
         "xp": usuario.xp or 0,
         "nivel": usuario.nivel or 1,
         "tema_actual": usuario.tema_actual or "Variables",
-        "porcentaje": usuario.porcentaje or 0
+        "porcentaje": usuario.porcentaje or 0,
+        "examen_completado": usuario.examen_completado or False
     }
 
 
@@ -1683,6 +1738,3 @@ def descontar_xp(request: XPDeductRequest, db: Session = Depends(get_db)):
         nivel=usuario.nivel,
         status="success"
     )
-
-
-
