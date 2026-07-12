@@ -970,6 +970,29 @@ async def update_student(user_id: str, request: UserUpdate, db: Session = Depend
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/api/admin/users/{user_id}")
+async def delete_student(user_id: str, db: Session = Depends(get_db)):
+    usuario = db.query(models.Usuario).filter(models.Usuario.id == user_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+        
+    try:
+        sesion_ids = [s.id for s in db.query(models.SesionChat).filter(models.SesionChat.usuario_id == user_id).all()]
+        if sesion_ids:
+            db.query(models.MensajeLog).filter(models.MensajeLog.sesion_id.in_(sesion_ids)).delete(synchronize_session=False)
+            
+        db.query(models.SesionChat).filter(models.SesionChat.usuario_id == user_id).delete(synchronize_session=False)
+        
+        db.query(models.ResolucionEjercicio).filter(models.ResolucionEjercicio.usuario_id == user_id).delete(synchronize_session=False)
+        
+        db.delete(usuario)
+        db.commit()
+        return {"status": "success", "message": f"Usuario {user_id} eliminado exitosamente."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"No se pudo eliminar el usuario debido a restricciones de base de datos o error interno: {str(e)}")
+
+
 def extract_text_from_file(file_content: bytes, filename: str) -> str:
     import io
     text = ""
