@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.config.database import engine, get_db
@@ -18,6 +18,9 @@ import tempfile
 import requests
 import json
 import re
+import asyncio
+import threading
+import sys
 import dotenv
 import unicodedata
 
@@ -239,7 +242,8 @@ def proxy_execute_code(request: ExecuteRequest):
                     python_env["PYTHONIOENCODING"] = "utf-8"
                     result = subprocess.run(
                         ["python3", main_file], 
-                        cwd=temp_dir, capture_output=True, timeout=15,
+                        cwd=temp_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        input=request.stdin or "", timeout=15,
                         encoding="utf-8", errors="replace", env=python_env
                     )
                     return {
@@ -266,7 +270,8 @@ def proxy_execute_code(request: ExecuteRequest):
                     class_name = main_file.replace(".java", "")
                     result = subprocess.run(
                         ["java", "-Dfile.encoding=UTF-8", class_name], 
-                        cwd=temp_dir, capture_output=True, timeout=15,
+                        cwd=temp_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        input=request.stdin or "", timeout=15,
                         encoding="utf-8", errors="replace"
                     )
                     return {
@@ -285,6 +290,152 @@ def proxy_execute_code(request: ExecuteRequest):
 
     except Exception as e:
         return {"compile": {"stderr": f"Error interno del servidor: {str(e)}"}, "run": {"code": 1}}
+
+
+@app.websocket("/api/ws/execute")
+async def websocket_execute(websocket: WebSocket):
+    await websocket.accept()
+    
+    try:
+        config = await websocket.receive_json()
+        language = config.get("language")
+        code = config.get("code", "")
+    except Exception as e:
+        await websocket.close(code=1003, reason="Formato de mensaje inválido")
+        return
+
+    if language not in ["python", "java"]:
+        await websocket.send_json({"type": "compile", "data": "Lenguaje no soportado."})
+        await websocket.close(code=1008)
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            main_file = None
+            if language == "python":
+                main_file = os.path.join(temp_dir, "main.py")
+                with open(main_file, "w", encoding="utf-8") as f:
+                    f.write(code)
+            elif language == "java":
+                match = re.search(r"public\s+class\s+(\w+)", code)
+                class_name_base = match.group(1) if match else "Main"
+                main_file = os.path.join(temp_dir, f"{class_name_base}.java")
+                with open(main_file, "w", encoding="utf-8") as f:
+                    f.write(code)
+
+            if language == "java":
+                await websocket.send_json({"type": "status", "data": "Compilando código...\n"})
+                compile_result = subprocess.run(
+                    ["javac", "-encoding", "utf-8", main_file],
+                    cwd=temp_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=10, encoding="utf-8", errors="replace"
+                )
+                if compile_result.returncode != 0:
+                    await websocket.send_json({"type": "stderr", "data": compile_result.stderr})
+                    await websocket.close(code=1000)
+                    return
+
+            if language == "python":
+                import copy
+                python_env = copy.deepcopy(os.environ)
+                python_env["PYTHONIOENCODING"] = "utf-8"
+                process = subprocess.Popen(
+                    ["python3", "-u", main_file],
+                    cwd=temp_dir,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=python_env,
+                    bufsize=0
+                )
+            else:
+                process = subprocess.Popen(
+                    ["java", "-Dfile.encoding=UTF-8", class_name_base],
+                    cwd=temp_dir,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=0
+                )
+
+            q = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def stream_reader(stream, msg_type):
+                try:
+                    while True:
+                        char = stream.read(1)
+                        if not char:
+                            break
+                        loop.call_soon_threadsafe(q.put_nowait, {"type": msg_type, "data": char})
+                except Exception:
+                    pass
+                finally:
+                    loop.call_soon_threadsafe(q.put_nowait, {"type": "stream_closed", "stream": msg_type})
+
+            t_stdout = threading.Thread(target=stream_reader, args=(process.stdout, "stdout"), daemon=True)
+            t_stderr = threading.Thread(target=stream_reader, args=(process.stderr, "stderr"), daemon=True)
+            t_stdout.start()
+            t_stderr.start()
+
+            async def ws_receiver():
+                try:
+                    while True:
+                        msg = await websocket.receive_json()
+                        if msg.get("type") == "stdin":
+                            data = msg.get("data", "")
+                            if process.poll() is None:
+                                process.stdin.write(data)
+                                process.stdin.flush()
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+
+            receiver_task = asyncio.create_task(ws_receiver())
+
+            active_streams = {"stdout", "stderr"}
+            while (active_streams and process.poll() is None) or not q.empty():
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=0.1)
+                    if item["type"] == "stream_closed":
+                        active_streams.discard(item["stream"])
+                    else:
+                        await websocket.send_json(item)
+                except asyncio.TimeoutError:
+                    if process.poll() is not None and q.empty():
+                        break
+                    continue
+                except Exception:
+                    break
+
+            code = process.poll() or 0
+            await websocket.send_json({"type": "exit", "code": code})
+            
+            receiver_task.cancel()
+            
+            if process.poll() is None:
+                process.terminate()
+                
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "stderr", "data": f"\nError en servidor de ejecución: {str(e)}\n"})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 def get_all_topics_from_db(db: Session, only_approved: bool = False) -> list:

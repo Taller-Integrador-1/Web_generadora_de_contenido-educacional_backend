@@ -25,6 +25,7 @@ class ExecuteRequest(BaseModel):
     language: str
     version: str
     files: List[PistonFile]
+    stdin: Optional[str] = ""
 
 class LoginRequest(BaseModel):
     usuario_id: str
